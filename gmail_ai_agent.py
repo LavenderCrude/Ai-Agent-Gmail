@@ -13,14 +13,12 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 import google.generativeai as genai
 
-# Load environment variables from .env or system
 load_dotenv()
 
-# Configure Gemini client
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+gemini_model = genai.GenerativeModel('gemini-2.5-flash') 
 
-# Gmail scopes: readonly + send + modify + Calendar
+
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/gmail.send',
@@ -35,8 +33,7 @@ if not MONGO_URI:
 client = MongoClient(MONGO_URI)
 db = client["email_agent_db"]
 processed_collection = db["processed_messages"]
-email_logs_collection = db["email_logs"]  # New collection for email and reply logs
-
+email_logs_collection = db["email_logs"] 
 # ---------------------------
 # Helpers: Simple DB for processed messages
 # ---------------------------
@@ -116,7 +113,7 @@ def gmail_authenticate():
     user_email = profile.get('emailAddress')
     print(f"\nAuthenticated with Gmail as: {user_email}")
     
-    return service, user_email
+    return service, creds, user_email  # Return creds as well for calendar
 
 # ---------------------------
 # Utilities: decode message payloads
@@ -188,7 +185,7 @@ def get_message_snippet_and_body(service, message) -> Dict[str, Any]:
         }
 
 # ---------------------------
-# Gemini analysis: classification + structured output
+# Gemini analysis: classification
 # ---------------------------
 EXTRA_SYSTEM = """
 You are an assistant that reads a plain-text email and returns EXACTLY one JSON object (no extra text).
@@ -234,7 +231,7 @@ Instructions:
 4) If the email is not important (e.g., a newsletter, promotion), set category to "not_important", action to "archive", and reply_template.should_reply to true. Provide a concise, polite automatic reply.
 5) If you are not confident, set confidence appropriately and prefer safe actions.
 6) Do not include any extra keys beyond the schema. Output JSON only.
-
+7) In End After sincerly, Name is Akhil Kushwaha. 
 Now analyze the email.
 """
 
@@ -282,7 +279,7 @@ def send_reply(service, reply_to: str, subject: str, body: str, thread_id: str=N
         msg['References'] = in_reply_to
     
     try:
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')  # Fixed: encode instead of decode
         body_req = {'raw': raw}
         if thread_id:
             body_req['threadId'] = thread_id
@@ -306,8 +303,8 @@ def modify_labels(service, message_id: str, add_labels: List[str]=None, remove_l
 # ---------------------------
 # Google Calendar Integration
 # ---------------------------
-def create_calendar_event(service, event_data: dict, attendee_email: str):
-    calendar_service = build('calendar', 'v3', credentials=service.credentials)
+def create_calendar_event(creds, event_data: dict, attendee_email: str):  # Changed: Accept creds directly
+    calendar_service = build('calendar', 'v3', credentials=creds)  # Build with creds
     
     event = {
         'summary': event_data.get('summary', 'New Event'),
@@ -351,17 +348,18 @@ def get_authenticated_email(service) -> Optional[str]:
 
 def main_loop(poll_interval=20):
     try:
-        service, user_email = gmail_authenticate()
+        service, creds, user_email = gmail_authenticate()
         print("Authenticated with Gmail.")
 
         while True:
             try:
                 query = "is:unread is:important"
+                # query = "is:unread"
                 messages_resp = service.users().messages().list(userId='me', q=query, maxResults=20).execute()
                 msgs = messages_resp.get('messages', []) or []
 
                 if not msgs:
-                    print(f"No new unread emails. Sleeping for {poll_interval}s...")
+                    print(f"No new important unread emails. Sleeping for {poll_interval}s...")  # Updated for clarity
                     time.sleep(poll_interval)
                     continue
 
@@ -394,8 +392,9 @@ def main_loop(poll_interval=20):
                         print("-" * 50)
 
                     event_data = structured.get('metadata', {}).get('calendar_event')
+                    calendar_created = False
                     if event_data and event_data.get('start') and event_data.get('end'):
-                        create_calendar_event(service, event_data, data['from_email'])
+                        calendar_created = create_calendar_event(creds, event_data, data['from_email'])  # Pass creds
 
                     action_status = ""
                     if reply_template.get('should_reply'):
@@ -427,6 +426,9 @@ def main_loop(poll_interval=20):
                         modify_labels(service, msg_id, remove_labels=['UNREAD'])
                         action_status += " Email processed, marked as read."
                         print("Email processed, marked as read.")
+
+                    if calendar_created:
+                        action_status += " Calendar event created."
 
                     # Store email and reply data in MongoDB
                     store_email_and_reply(data, reply_template, action_status)
