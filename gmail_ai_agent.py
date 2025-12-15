@@ -12,20 +12,20 @@ from googleapiclient.discovery import build
 from dotenv import load_dotenv
 from pymongo import MongoClient
 import google.generativeai as genai
+from datetime import datetime, timedelta
+import pytz
 
 load_dotenv()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel('gemini-2.5-flash') 
-
-
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')  
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/calendar.events'
 ]
 
-# MongoDB setup
+
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise ValueError("MONGO_URI not set in .env file or environment variables")
@@ -34,9 +34,7 @@ client = MongoClient(MONGO_URI)
 db = client["email_agent_db"]
 processed_collection = db["processed_messages"]
 email_logs_collection = db["email_logs"] 
-# ---------------------------
-# Helpers: Simple DB for processed messages
-# ---------------------------
+
 
 def mark_processed(msg_id: str):
     doc = {"_id": msg_id, "processed_at": int(time.time())}
@@ -45,9 +43,6 @@ def mark_processed(msg_id: str):
 def is_processed(msg_id: str) -> bool:
     return processed_collection.find_one({"_id": msg_id}) is not None
 
-# ---------------------------
-# Helpers: Store email and reply data in MongoDB
-# ---------------------------
 
 def store_email_and_reply(data: Dict[str, Any], reply_template: Dict[str, Any], action_status: str):
     email_log = {
@@ -65,10 +60,6 @@ def store_email_and_reply(data: Dict[str, Any], reply_template: Dict[str, Any], 
         "processed_at": int(time.time())
     }
     email_logs_collection.insert_one(email_log)
-
-# ---------------------------
-# Gmail auth / client
-# ---------------------------
 
 def gmail_authenticate():
     creds = None
@@ -113,11 +104,7 @@ def gmail_authenticate():
     user_email = profile.get('emailAddress')
     print(f"\nAuthenticated with Gmail as: {user_email}")
     
-    return service, creds, user_email  # Return creds as well for calendar
-
-# ---------------------------
-# Utilities: decode message payloads
-# ---------------------------
+    return service, creds, user_email
 
 def extract_email_address(from_header: str) -> str:
     m = re.search(r'<([^>]+)>', from_header)
@@ -184,9 +171,6 @@ def get_message_snippet_and_body(service, message) -> Dict[str, Any]:
             "body": ""
         }
 
-# ---------------------------
-# Gemini analysis: classification
-# ---------------------------
 EXTRA_SYSTEM = """
 You are an assistant that reads a plain-text email and returns EXACTLY one JSON object (no extra text).
 The JSON must match the schema below (keys must exist; set values to null if not applicable).
@@ -264,10 +248,6 @@ def call_gemini_for_structured(email_subject: str, email_from: str, email_body: 
         }
     return parsed
 
-# ---------------------------
-# Gmail send/reply/label helpers
-# ---------------------------
-
 def send_reply(service, reply_to: str, subject: str, body: str, thread_id: str=None, in_reply_to: str=None, sender_email: str=None):
     msg = MIMEText(body)
     if sender_email:
@@ -279,7 +259,7 @@ def send_reply(service, reply_to: str, subject: str, body: str, thread_id: str=N
         msg['References'] = in_reply_to
     
     try:
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')  # Fixed: encode instead of decode
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         body_req = {'raw': raw}
         if thread_id:
             body_req['threadId'] = thread_id
@@ -300,51 +280,62 @@ def modify_labels(service, message_id: str, add_labels: List[str]=None, remove_l
         print(f"Error modifying labels for message {message_id}: {e}")
         return None
 
-# ---------------------------
-# Google Calendar Integration
-# ---------------------------
-def create_calendar_event(creds, event_data: dict, attendee_email: str):  # Changed: Accept creds directly
-    calendar_service = build('calendar', 'v3', credentials=creds)  # Build with creds
+def shift_one_hour_earlier(iso_time: str) -> str:
+    if not iso_time:
+        return None
+    try:
+       
+        dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            ist = pytz.timezone("Asia/Kolkata")
+            dt = ist.localize(dt)
+        else:
+            dt = dt.astimezone(pytz.timezone("Asia/Kolkata"))
+        new_dt = dt - timedelta(hours=1)
+        return new_dt.isoformat()
+    except Exception as e:
+        print(f"Error shifting time: {e}")
+        return iso_time
+def create_calendar_event(creds, event_data: dict, attendee_email: str):
+    calendar_service = build('calendar', 'v3', credentials=creds)
     
+    original_start = event_data.get('start')
+    original_end = event_data.get('end')
+    
+    if not original_start or not original_end:
+        return False
+
+    new_start = shift_one_hour_earlier(original_start)
+    new_end = shift_one_hour_earlier(original_end)
+
     event = {
-        'summary': event_data.get('summary', 'New Event'),
+        'summary': f"PREP: {event_data.get('summary', 'Interview/Meeting')}",
         'location': event_data.get('location', 'Online'),
-        'description': event_data.get('description', ''),
+        'description': f"[Preparation Block - 1 hour before actual event]\n"
+                      f"Original time: {original_start} to {original_end}\n\n"
+                      f"{event_data.get('description', '')}",
         'start': {
-            'dateTime': event_data.get('start'),
+            'dateTime': new_start,
             'timeZone': 'Asia/Kolkata',
         },
         'end': {
-            'dateTime': event_data.get('end'),
+            'dateTime': new_end,
             'timeZone': 'Asia/Kolkata',
         },
-        'attendees': [
-            {'email': attendee_email}
-        ],
+        'attendees': [{'email': attendee_email}],
+        'reminders': {
+            'useDefault': False,
+            'overrides': [{'method': 'popup', 'minutes': 30}]
+        }
     }
 
     try:
         created_event = calendar_service.events().insert(calendarId='primary', body=event).execute()
-        print(f"Event created: {created_event.get('htmlLink')}")
+        print(f"PREP EVENT CREATED (1 hour before): {created_event.get('htmlLink')}")
         return True
     except Exception as e:
         print(f"Failed to create calendar event: {e}")
         return False
-
-# ---------------------------
-# Utility to get authenticated email
-# ---------------------------
-def get_authenticated_email(service) -> Optional[str]:
-    try:
-        profile = service.users().getProfile(userId='me').execute()
-        return profile.get('emailAddress')
-    except Exception as e:
-        print(f"Error fetching authenticated email: {e}")
-        return None
-
-# ---------------------------
-# Main program flow
-# ---------------------------
 
 def main_loop(poll_interval=20):
     try:
@@ -354,12 +345,11 @@ def main_loop(poll_interval=20):
         while True:
             try:
                 query = "is:unread is:important"
-                # query = "is:unread"
                 messages_resp = service.users().messages().list(userId='me', q=query, maxResults=20).execute()
                 msgs = messages_resp.get('messages', []) or []
 
                 if not msgs:
-                    print(f"No new important unread emails. Sleeping for {poll_interval}s...")  # Updated for clarity
+                    print(f"No new important unread emails. Sleeping for {poll_interval}s...")
                     time.sleep(poll_interval)
                     continue
 
@@ -372,10 +362,7 @@ def main_loop(poll_interval=20):
                     print("-" * 50)
                     print(f"Processing NEW EMAIL:")
                     print(f"From: {data['from']}")
-                    print(f"To: {data['to']}")
-                    print(f"Date: {data['date']}")
                     print(f"Subject: {data['subject']}")
-                    print(f"Body: {data['body']}")
                     print("-" * 50)
 
                     structured = call_gemini_for_structured(data['subject'], data['from'], data['body'])
@@ -394,7 +381,7 @@ def main_loop(poll_interval=20):
                     event_data = structured.get('metadata', {}).get('calendar_event')
                     calendar_created = False
                     if event_data and event_data.get('start') and event_data.get('end'):
-                        calendar_created = create_calendar_event(creds, event_data, data['from_email'])  # Pass creds
+                        calendar_created = create_calendar_event(creds, event_data, data['from_email'])
 
                     action_status = ""
                     if reply_template.get('should_reply'):
@@ -428,11 +415,9 @@ def main_loop(poll_interval=20):
                         print("Email processed, marked as read.")
 
                     if calendar_created:
-                        action_status += " Calendar event created."
+                        action_status += " Calendar PREP event created 1 hour early."
 
-                    # Store email and reply data in MongoDB
                     store_email_and_reply(data, reply_template, action_status)
-
                     mark_processed(msg_id)
                     time.sleep(2)
                 
